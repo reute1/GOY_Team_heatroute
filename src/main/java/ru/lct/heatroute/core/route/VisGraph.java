@@ -1,7 +1,10 @@
 package ru.lct.heatroute.core.route;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.IntStream;
 
 /**
@@ -28,14 +31,32 @@ final class VisGraph {
     }
 
     void build(Env env, double maxEdge) {
-        final int[][][] tmpN = new int[n][][];
         @SuppressWarnings("unchecked")
         final List<double[]>[] found = new List[n];
+        // Кандидаты в соседи — только из ячеек сетки со стороной maxEdge вокруг вершины (а не все пары).
+        Map<Long, List<Integer>> cells = new HashMap<>();
+        for (int i = 0; i < n; i++) {
+            cells.computeIfAbsent(cell(x[i], y[i], maxEdge, 0, 0), k -> new ArrayList<>()).add(i);
+        }
         ThreadLocal<SegGrid.Ctx> tl = ThreadLocal.withInitial(SegGrid.Ctx::new);
         IntStream.range(0, n).parallel().forEach(i -> {
             SegGrid.Ctx ctx = tl.get();
             List<double[]> l = new ArrayList<>();
-            for (int j = i + 1; j < n; j++) {
+            List<Integer> cand = new ArrayList<>();
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    List<Integer> c = cells.get(cell(x[i], y[i], maxEdge, dx, dy));
+                    if (c != null) {
+                        for (int j : c) {
+                            if (j > i) {
+                                cand.add(j);
+                            }
+                        }
+                    }
+                }
+            }
+            Collections.sort(cand); // порядок рёбер как при полном переборе — расчёт детерминирован
+            for (int j : cand) {
                 double dx = x[j] - x[i];
                 double dy = y[j] - y[i];
                 double d2 = dx * dx + dy * dy;
@@ -49,6 +70,7 @@ final class VisGraph {
             }
             found[i] = l;
         });
+        cells.clear();
         int[] deg = new int[n];
         for (int i = 0; i < n; i++) {
             for (double[] e : found[i]) {
@@ -77,5 +99,11 @@ final class VisGraph {
                 edgeCount++;
             }
         }
+    }
+
+    private static long cell(double px, double py, double size, int dx, int dy) {
+        long cx = (long) Math.floor(px / size) + dx;
+        long cy = (long) Math.floor(py / size) + dy;
+        return (cx << 32) ^ (cy & 0xffffffffL);
     }
 }

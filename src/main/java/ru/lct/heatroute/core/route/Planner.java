@@ -86,6 +86,9 @@ public final class Planner {
     private double[] nsBx;
     private double[] nsBy;
     private int[] nsLine;
+    /** Индексы: отрезки существующей сети (id = индекс в ns*) и существующие камеры (id = индекс камеры). */
+    private final SegGrid nsGrid = new SegGrid(50);
+    private final SegGrid chGrid = new SegGrid(20);
 
     // кэш мест присоединения к существующей сети для вершин графа
     private TieCand[][] tieCache;
@@ -184,14 +187,15 @@ public final class Planner {
         for (InputData.Target t : data.targets) {
             total += t.flow;
         }
-        RuleBook.Pipe dp = rules.pipeForFlow(total);
-        designDn = dp != null ? dp.dn : rules.pipes.get(rules.pipes.size() - 1).dn;
+        prepareNetwork();
+        double maxGroupFlow = maxGroupFlow();
+        designDn = dnOf(maxGroupFlow);
         result.stats.put("targets", data.targets.size());
         result.stats.put("total_flow_tph", round(total, 2));
+        result.stats.put("max_group_flow_tph", round(maxGroupFlow, 2));
         result.stats.put("design_dn", designDn);
 
         env = new Env(data, rules, designDn);
-        prepareNetwork();
         List<double[]> pts = env.generateNodes(ctx);
         int base = pts.size();
         prepareTargets(pts);
@@ -270,7 +274,72 @@ public final class Planner {
             nsBx[i] = segs.get(i)[2];
             nsBy[i] = segs.get(i)[3];
             nsLine[i] = own.get(i);
+            nsGrid.add(nsAx[i], nsAy[i], nsBx[i], nsBy[i], i);
         }
+        for (int k = 0; k < data.chambers.size(); k++) {
+            InputData.Chamber ch = data.chambers.get(k);
+            chGrid.add(ch.x, ch.y, ch.x, ch.y, k);
+        }
+    }
+
+    /**
+     * Наибольший суммарный расход группы точек, которые могут иметь общую новую сеть.
+     * Точки i и j связываются, если расстояние между ними меньше суммы их расстояний до существующей
+     * сети (с запасом на обходы): иначе общий участок заведомо не короче двух отдельных подключений.
+     * По этой группе выбирается расчётный ДУ отступов — а не по сумме всех точек файла.
+     */
+    private double maxGroupFlow() {
+        int nt = data.targets.size();
+        double[] dNet = new double[nt];
+        for (int t = 0; t < nt; t++) {
+            InputData.Target T = data.targets.get(t);
+            double best = Double.POSITIVE_INFINITY;
+            for (int s = 0; s < nsAx.length; s++) {
+                best = Math.min(best, Geo.pointSegDist(T.x, T.y, nsAx[s], nsAy[s], nsBx[s], nsBy[s]));
+            }
+            dNet[t] = best;
+        }
+        int[] parent = new int[nt];
+        for (int t = 0; t < nt; t++) {
+            parent[t] = t;
+        }
+        for (int i = 0; i < nt; i++) {
+            InputData.Target A = data.targets.get(i);
+            for (int j = i + 1; j < nt; j++) {
+                InputData.Target B = data.targets.get(j);
+                double reach = GROUP_DETOUR * (dNet[i] + dNet[j]) + GROUP_MARGIN;
+                if (Geo.dist(A.x, A.y, B.x, B.y) < reach) {
+                    parent[find(parent, i)] = find(parent, j);
+                }
+            }
+        }
+        Map<Integer, Double> flow = new HashMap<>();
+        groupOf = new int[nt];
+        for (int t = 0; t < nt; t++) {
+            groupOf[t] = find(parent, t);
+            flow.merge(groupOf[t], data.targets.get(t).flow, Double::sum);
+        }
+        result.stats.put("target_groups", flow.size());
+        double max = 0;
+        for (double f : flow.values()) {
+            max = Math.max(max, f);
+        }
+        return max;
+    }
+
+    /** Группа точки (представитель в системе непересекающихся множеств). */
+    private int[] groupOf;
+
+    /** Запас на обходы препятствий при группировке точек. */
+    private static final double GROUP_DETOUR = 1.5;
+    private static final double GROUP_MARGIN = 100;
+
+    private static int find(int[] p, int i) {
+        while (p[i] != i) {
+            p[i] = p[p[i]];
+            i = p[i];
+        }
+        return i;
     }
 
     private void prepareTargets(List<double[]> pts) {
@@ -454,9 +523,8 @@ public final class Planner {
         }
         double ux = g.x[u];
         double uy = g.y[u];
-        int n = nsAx.length;
         List<double[]> feet = new ArrayList<>(); // dist, seg, fx, fy
-        for (int s = 0; s < n; s++) {
+        nsGrid.query(ux, uy, ux, uy, opt.tieSearchRadius, ctx, s -> {
             double t = Geo.projT(ux, uy, nsAx[s], nsAy[s], nsBx[s], nsBy[s]);
             double fx = nsAx[s] + t * (nsBx[s] - nsAx[s]);
             double fy = nsAy[s] + t * (nsBy[s] - nsAy[s]);
@@ -464,8 +532,9 @@ public final class Planner {
             if (d <= opt.tieSearchRadius) {
                 feet.add(new double[]{d, s, fx, fy});
             }
-        }
-        feet.sort((a, b) -> Double.compare(a[0], b[0]));
+            return true;
+        });
+        feet.sort((a, b) -> a[0] != b[0] ? Double.compare(a[0], b[0]) : Double.compare(a[1], b[1]));
         List<TieCand> res = new ArrayList<>();
         Set<Integer> chambersDone = new HashSet<>();
         for (double[] f : feet) {
@@ -477,12 +546,14 @@ public final class Planner {
             double fy = f[3];
             // камеры в радиусе 10 м — правило обязательного использования существующей камеры
             List<Integer> near = new ArrayList<>();
-            for (int k = 0; k < data.chambers.size(); k++) {
+            chGrid.query(fx, fy, fx, fy, rules.tieSnapRadius, ctx, k -> {
                 InputData.Chamber ch = data.chambers.get(k);
                 if (ch.adjacency >= 0 && Geo.dist(fx, fy, ch.x, ch.y) <= rules.tieSnapRadius) {
                     near.add(k);
                 }
-            }
+                return true;
+            });
+            Collections.sort(near);
             for (int k : near) {
                 if (chambersDone.add(k)) {
                     InputData.Chamber ch = data.chambers.get(k);
@@ -847,11 +918,19 @@ public final class Planner {
                 remaining.add(t);
             }
         }
+        // Кэш лучших подключений: после шага пересчитываются только точки, чья область поиска
+        // задета изменившейся частью сети (результат тот же, что при полном пересчёте).
+        Goal[] cache = new Goal[data.targets.size()];
+        boolean[] valid = new boolean[data.targets.size()];
         while (!remaining.isEmpty()) {
             Goal best = null;
             int bestT = -1;
             for (int t : remaining) {
-                Goal gl = connectAny(t, F, st);
+                if (!valid[t]) {
+                    cache[t] = connectAny(t, F, st);
+                    valid[t] = true;
+                }
+                Goal gl = cache[t];
                 if (gl != null && (best == null || gl.cost < best.cost)) {
                     best = gl;
                     bestT = t;
@@ -862,8 +941,43 @@ public final class Planner {
             }
             commit(F, bestT, best);
             remaining.remove(Integer.valueOf(bestT));
+            invalidate(F, bestT, remaining, cache, valid);
         }
         return F;
+    }
+
+    /** Запас к радиусу области поиска: разнос новых участков и отступы при проверке ответвлений. */
+    private static final double INVALIDATE_MARGIN = 5;
+
+    /**
+     * Поиск Дейкстры от входа E с найденной стоимостью c не выходит за радиус c / (мин. вес метра):
+     * все слагаемые стоимости неотрицательны, а вес ребра не меньше веса его длины. Изменения сети
+     * дальше этого радиуса не влияют на результат поиска. Изменились: новая цепочка и участки
+     * от места присоединения до корня (вырос расход).
+     */
+    private void invalidate(Forest F, int committed, List<Integer> remaining, Goal[] cache, boolean[] valid) {
+        List<TNode> changed = new ArrayList<>();
+        for (TNode n = F.targetNode[committed]; n != null && n.parent != null; n = n.parent) {
+            changed.add(n);
+        }
+        for (int t : remaining) {
+            Goal gl = cache[t];
+            if (!valid[t]) {
+                continue;
+            }
+            if (gl == null || gl.entry > 0 || gl.relaxed) {
+                valid[t] = false; // неподключаемость и запасные пути — пересчитываются всегда
+                continue;
+            }
+            int e = eOpts[t][0];
+            double r = gl.cost / w(1, 1, price(data.targets.get(t).flow)) + INVALIDATE_MARGIN;
+            for (TNode n : changed) {
+                if (Geo.pointSegDist(g.x[e], g.y[e], n.x, n.y, n.parent.x, n.parent.y) <= r) {
+                    valid[t] = false;
+                    break;
+                }
+            }
+        }
     }
 
     /** Подключение точки по стратегии; ограничения стратегии снимаются, если иначе точка не подключается. */
@@ -902,32 +1016,64 @@ public final class Planner {
 
     /** Жадное построение и локальное улучшение порядка вставки. */
     private Forest planBest(Strategy st) {
+        long t0 = System.currentTimeMillis();
         Forest F = plan(st);
+        result.stats.merge("greedy_ms", System.currentTimeMillis() - t0, (a, b) -> (Long) a + (Long) b);
         return opt.improveEvals > 0 ? improve(st, F) : F;
     }
 
     /**
-     * Локальный поиск по порядку вставки: точка переносится на другую позицию, лес перестраивается
-     * в новом порядке, перенос принимается при уменьшении S (первое улучшение, затем поиск заново).
-     * Предел — число перестроений, поэтому результат детерминирован.
+     * Локальный поиск по порядку вставки, отдельно в каждой группе точек (группы независимы,
+     * поэтому перестановки между группами ничего не меняют): точка переносится на другую позицию,
+     * сеть группы перестраивается в новом порядке, перенос принимается при уменьшении S.
+     * Итог сравнивается с жадным решением целиком — хуже жадного результат не становится.
      */
     private Forest improve(Strategy st, Forest greedy) {
         long t0 = System.currentTimeMillis();
-        List<Integer> best = new ArrayList<>(greedy.order);
+        List<Integer> all = new ArrayList<>(greedy.order);
         for (int t = 0; t < data.targets.size(); t++) {
-            if (eOpts[t].length > 0 && !best.contains(t)) {
-                best.add(t); // неподключённые жадно — в конец, вдруг в другом порядке найдётся маршрут
+            if (eOpts[t].length > 0 && !all.contains(t)) {
+                all.add(t); // неподключённые жадно — в конец, вдруг в другом порядке найдётся маршрут
             }
         }
+        Map<Integer, List<Integer>> groups = new java.util.LinkedHashMap<>();
+        for (int t : all) {
+            groups.computeIfAbsent(groupOf[t], k -> new ArrayList<>()).add(t);
+        }
         double s0 = build(greedy, st, false).score;
-        double bestS = s0;
         List<String> saved = warnSink;
         warnSink = new ArrayList<>(); // промежуточные перестроения не пишут в диагностику
+        int[] stats = new int[3]; // перестроения, принято, остановлено по пределу
+        List<Integer> order = new ArrayList<>();
+        for (List<Integer> grp : groups.values()) {
+            // время делится между группами пропорционально числу точек
+            long budget = Math.max(1000, opt.improveMs * grp.size() / Math.max(1, all.size()));
+            order.addAll(grp.size() < 2 ? grp : improveGroup(st, grp, budget, stats));
+        }
+        Forest cand = planOrder(st, order);
+        double s1 = build(cand, st, false).score;
+        if (s1 > s0 - 1e-9 || cand.relaxed > greedy.relaxed) {
+            order = greedy.order; // улучшения нет — остаётся жадное решение
+            s1 = s0;
+        }
+        warnSink = saved;
+        st.improveNote = String.format(Locale.ROOT,
+                "Локальное улучшение порядка вставки: S %.4f → %.4f (групп точек %d, %d перестроений, принято %d%s, %d мс)",
+                s0, s1, groups.size(), stats[0], stats[1],
+                stats[2] > 0 ? ", остановлено по пределу" : ", локальный минимум", System.currentTimeMillis() - t0);
+        return planOrder(st, order); // финальное построение — с диагностикой и состоянием новой сети
+    }
+
+    /** Локальный поиск порядка внутри одной группы. stats: перестроения, принято, остановлено по пределу. */
+    private List<Integer> improveGroup(Strategy st, List<Integer> start, long budgetMs, int[] stats) {
+        long t0 = System.currentTimeMillis();
+        List<Integer> best = new ArrayList<>(start);
+        Forest F0 = planOrder(st, best);
+        int relaxed0 = F0.relaxed;
+        double bestS = build(F0, st, false).score; // точки других групп — постоянный штраф, на сравнение не влияет
         int evals = 0;
-        int accepted = 0;
         int n = best.size();
         int moves = n * n;
-        boolean stop = false;
         // переносы (i → j) перебираются по кругу; после улучшения перебор продолжается с того же места,
         // остановка — когда полный круг прошёл без улучшений
         for (int m = 0, idle = 0; idle < moves; m = (m + 1) % moves, idle++) {
@@ -936,31 +1082,27 @@ public final class Planner {
             if (j == i || j == i - 1) {
                 continue; // перенос i на i-1 совпадает с переносом i-1 на i
             }
-            if (evals >= opt.improveEvals || System.currentTimeMillis() - t0 > opt.improveMs) {
-                stop = true;
+            if (evals >= opt.improveEvals || System.currentTimeMillis() - t0 > budgetMs) {
+                stats[2]++;
                 break;
             }
             List<Integer> o = new ArrayList<>(best);
             o.add(j, o.remove(i));
             evals++;
             Forest F = planOrder(st, o);
-            if (F.relaxed > greedy.relaxed) {
+            if (F.relaxed > relaxed0) {
                 continue; // стратегия варианта не должна размываться снятием её ограничений
             }
             double s = build(F, st, false).score;
             if (s < bestS - 1e-9) {
                 best = o;
                 bestS = s;
-                accepted++;
+                stats[1]++;
                 idle = 0;
             }
         }
-        warnSink = saved;
-        st.improveNote = String.format(Locale.ROOT,
-                "Локальное улучшение порядка вставки: S %.4f → %.4f (%d перестроений, принято %d%s, %d мс)",
-                s0, bestS, evals, accepted, stop ? ", остановлено по пределу" : ", локальный минимум",
-                System.currentTimeMillis() - t0);
-        return planOrder(st, best); // финальное построение — с диагностикой и состоянием новой сети
+        stats[0] += evals;
+        return best;
     }
 
     private void commit(Forest F, int t, Goal gl) {
