@@ -1,0 +1,32 @@
+server:
+  port: 8080
+  tomcat:
+    max-swallow-size: -1
+    max-http-form-post-size: -1
+
+spring:
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/heatroute}
+    username: ${DB_USER:heatroute}
+    password: ${DB_PASSWORD:heatroute}
+  sql:
+    init:
+      mode: always
+  servlet:
+    multipart:
+      max-file-size: 3GB
+      max-request-size: 3GB
+      file-size-threshold: 0
+      location: ${java.io.tmpdir}
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+  api-docs:
+    path: /v3/api-docs
+
+app:
+  storage-dir: ${STORAGE_DIR:./jobs}
+  workers: ${WORKERS:2}
+  max-edge: 700
+  tie-search-radius: 600

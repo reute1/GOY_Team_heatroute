@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Трассы подключения к теплосети</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  :root { --bg:#f6f7f9; --panel:#fff; --ink:#1d2330; --muted:#667085; --line:#e4e7ec; --accent:#2563eb; --bad:#d92d20; --ok:#079455; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color:var(--ink); background:var(--bg); }
+  .app { display:grid; grid-template-columns: 380px 1fr; height:100vh; }
+  aside { background:var(--panel); border-right:1px solid var(--line); overflow:auto; padding:16px; }
+  h1 { font-size:17px; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:12px; margin-bottom:14px; }
+  .card { border:1px solid var(--line); border-radius:10px; padding:12px; margin-bottom:12px; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin:0 0 8px; }
+  button, .btn { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:7px 12px; cursor:pointer; font:inherit; text-decoration:none; display:inline-block; }
+  button.secondary { background:#eef2ff; color:var(--accent); }
+  input[type=file] { width:100%; margin-bottom:8px; }
+  select { width:100%; padding:6px; border-radius:8px; border:1px solid var(--line); font:inherit; }
+  .status { font-size:12px; color:var(--muted); margin-top:6px; }
+  .variant { border:1px solid var(--line); border-radius:10px; padding:10px; margin-bottom:8px; cursor:pointer; }
+  .variant.active { border-color:var(--accent); box-shadow:0 0 0 2px #dbe5ff; }
+  .variant .top { display:flex; justify-content:space-between; align-items:baseline; }
+  .variant .rank { font-weight:700; }
+  .variant .score { font-variant-numeric: tabular-nums; font-weight:600; }
+  .kv { display:grid; grid-template-columns:1fr auto; gap:2px 10px; font-size:12px; margin-top:6px; font-variant-numeric: tabular-nums; }
+  .kv span:nth-child(odd) { color:var(--muted); }
+  .checks { margin:6px 0 0; padding-left:16px; font-size:12px; color:var(--muted); }
+  .checks li.bad { color:var(--bad); }
+  .strategy { font-size:12px; color:var(--muted); }
+  #map { height:100vh; background:#eef0f3; }
+  .legend { background:#fff; padding:8px 10px; border-radius:8px; box-shadow:0 1px 4px rgba(0,0,0,.2); font-size:12px; line-height:1.6; }
+  .legend i { display:inline-block; width:18px; height:4px; vertical-align:middle; margin-right:6px; }
+  .legend b { display:inline-block; width:10px; height:10px; vertical-align:middle; margin-right:6px; }
+  .warn { font-size:12px; color:var(--muted); max-height:140px; overflow:auto; padding-left:16px; margin:0; }
+  @media (max-width: 800px) { .app { grid-template-columns:1fr; grid-template-rows:auto 70vh; height:auto; } #map { height:70vh; } }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside>
+    <h1>Трассы подключения к тепловым сетям</h1>
+    <div class="sub">ЛЦТ-2026 · автоматическое построение вариантов подключения перспективных ОКС</div>
+
+    <div class="card" id="uploadCard">
+      <h2>Расчёт на сервере</h2>
+      <input type="file" id="file" accept=".geojson,.json">
+      <button id="run">Загрузить и рассчитать</button>
+      <div class="status" id="status"></div>
+      <div style="margin-top:10px">
+        <select id="jobs"><option value="">— предыдущие задачи —</option></select>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Открыть файлы локально</h2>
+      <div class="status" style="margin:0 0 6px">Входной набор</div>
+      <input type="file" id="localIn" accept=".geojson,.json">
+      <div class="status" style="margin:0 0 6px">Результат</div>
+      <input type="file" id="localOut" accept=".geojson,.json">
+    </div>
+
+    <div class="card" id="variantsCard" style="display:none">
+      <h2>Варианты (по возрастанию S)</h2>
+      <div id="variants"></div>
+      <a class="btn" id="download" style="display:none" download>Скачать результат GeoJSON</a>
+    </div>
+
+    <div class="card" id="warnCard" style="display:none">
+      <h2>Диагностика данных</h2>
+      <ul class="warn" id="warnings"></ul>
+    </div>
+  </aside>
+  <div id="map"></div>
+</div>
+
+<script>
+const map = L.map('map', { preferCanvas: true, zoomControl: true });
+const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 20, maxNativeZoom: 19, attribution: '© OpenStreetMap' });
+osm.addTo(map);
+map.setView([55.698, 37.64], 15);
+
+const layers = { input: L.layerGroup().addTo(map), result: L.layerGroup().addTo(map) };
+L.control.layers({ 'OSM': osm }, { 'Исходные данные': layers.input, 'Новая сеть': layers.result }).addTo(map);
+
+const legend = L.control({ position: 'bottomright' });
+legend.onAdd = () => {
+  const d = L.DomUtil.create('div', 'legend');
+  d.innerHTML = '<div><i style="background:#d62728;height:4px"></i>существующая сеть</div>' +
+    '<div><i style="background:#2563eb"></i>новая сеть (толщина ~ ДУ)</div>' +
+    '<div><i style="background:#db2777"></i>спецпроход</div>' +
+    '<div><b style="background:#f59e0b;transform:rotate(45deg)"></b>новая камера</div>' +
+    '<div><b style="background:#fff;border:1px solid #333;border-radius:50%"></b>технический узел</div>' +
+    '<div><b style="background:#16a34a;border-radius:50%"></b>точка подключения ОКС</div>';
+  return d;
+};
+legend.addTo(map);
+
+const RCOL = { oks:'#9aa1ab', park:'#86c77f', social_area:'#f4b183', prohibited_site:'#e57373', water:'#7fb5e0',
+  railway:'#a99bd1', road:'#f7c873', tram_tracks:'#c7a36b', gas_pipeline:'#e8590c', power_cable:'#7048e8' };
+
+let inputData = null, resultData = null, activeVariant = null, unconnected = new Set();
+
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function popup(p) {
+  return '<table style="font-size:12px">' + Object.entries(p).filter(([k]) => k !== 'checks')
+    .map(([k, v]) => `<tr><td style="color:#667085;padding-right:8px">${esc(k)}</td><td>${esc(Array.isArray(v) ? JSON.stringify(v) : v)}</td></tr>`).join('') + '</table>';
+}
+const fmt = (n, d = 0) => Number(n).toLocaleString('ru-RU', { maximumFractionDigits: d, minimumFractionDigits: d });
+
+function drawInput() {
+  layers.input.clearLayers();
+  if (!inputData) return;
+  const g = L.geoJSON(inputData, {
+    style: f => {
+      const p = f.properties || {};
+      if (p.object_type === 'heat_network') return { color: '#d62728', weight: 4, opacity: .9 };
+      if (p.object_type === 'restriction') {
+        const c = RCOL[p.restriction_type] || '#e57373';
+        const line = f.geometry && f.geometry.type.includes('Line');
+        return line ? { color: c, weight: 2, dashArray: '6 4' } : { color: '#667085', weight: .6, fillColor: c, fillOpacity: .45 };
+      }
+      return {};
+    },
+    pointToLayer: (f, ll) => {
+      const t = f.properties.object_type;
+      if (t === 'oks_connection_point') {
+        const bad = unconnected.has(String(f.properties.id));
+        return L.circleMarker(ll, { radius: 6, color: bad ? '#d92d20' : '#14532d', weight: bad ? 3 : 1, fillColor: bad ? '#fecaca' : '#16a34a', fillOpacity: 1 })
+          .bindTooltip(String(f.properties.id), { permanent: true, direction: 'right', className: '' });
+      }
+      if (t === 'heat_chamber') return L.circleMarker(ll, { radius: 5, color: '#7f1d1d', fillColor: '#d62728', fillOpacity: 1, weight: 1 });
+      if (t === 'source') return L.circleMarker(ll, { radius: 9, color: '#000', fillColor: '#111', fillOpacity: 1 });
+      return L.circleMarker(ll, { radius: 3 });
+    },
+    onEachFeature: (f, l) => l.bindPopup(popup(f.properties || {}))
+  }).addTo(layers.input);
+  try { map.fitBounds(g.getBounds(), { padding: [20, 20] }); } catch (e) {}
+}
+
+function drawResult() {
+  layers.result.clearLayers();
+  if (!resultData || !activeVariant) return;
+  const feats = resultData.features.filter(f => String(f.properties.variant_id) === String(activeVariant));
+  L.geoJSON({ type: 'FeatureCollection', features: feats.filter(f => f.geometry) }, {
+    style: f => {
+      const p = f.properties;
+      return { color: p.laying_method === 'special' ? '#db2777' : '#2563eb', weight: 2 + (p.diameter || 50) / 70, opacity: .95, lineCap: 'round' };
+    },
+    pointToLayer: (f, ll) => {
+      const t = f.properties.object_type;
+      if (t === 'heat_chamber') return L.marker(ll, { icon: L.divIcon({ className: '', html: '<div style="width:12px;height:12px;background:#f59e0b;border:1.5px solid #111;transform:rotate(45deg)"></div>', iconSize: [12, 12] }) });
+      return L.circleMarker(ll, { radius: 3.5, color: '#111', weight: 1, fillColor: '#fff', fillOpacity: 1 });
+    },
+    onEachFeature: (f, l) => l.bindPopup(popup(f.properties))
+  }).addTo(layers.result);
+}
+
+function renderVariants() {
+  const box = document.getElementById('variants');
+  box.innerHTML = '';
+  if (!resultData) return;
+  const sums = resultData.features.filter(f => f.properties.object_type === 'variant_summary')
+    .map(f => f.properties).sort((a, b) => a.rank - b.rank);
+  document.getElementById('variantsCard').style.display = sums.length ? '' : 'none';
+  if (!activeVariant && sums.length) activeVariant = sums[0].variant_id;
+  for (const s of sums) {
+    const div = document.createElement('div');
+    div.className = 'variant' + (String(s.variant_id) === String(activeVariant) ? ' active' : '');
+    const checks = (s.checks || []).map(c => `<li class="${/не подключена|Превышена|нарушений [1-9]|> 90/.test(c) ? 'bad' : ''}">${esc(c)}</li>`).join('');
+    div.innerHTML = `<div class="top"><span class="rank">#${s.rank} · ${esc(s.variant_id)}</span><span class="score">S = ${fmt(s.score, 4)}</span></div>
+      <div class="strategy">${esc(s.strategy || '')}</div>
+      <div class="kv">
+        <span>Итоговая стоимость</span><span>${fmt(s.calculated_cost / 1e6, 2)} млн ₽</span>
+        <span>Стоимость строительства</span><span>${fmt(s.construction_cost / 1e6, 2)} млн ₽</span>
+        <span>Новые камеры</span><span>${fmt(s.chamber_construction_cost / 1e6, 1)} млн ₽</span>
+        <span>Врезки в сущ. камеры</span><span>${s.existing_chamber_tie_in_count}</span>
+        <span>Длина новой сети</span><span>${fmt(s.new_network_length, 1)} м</span>
+        <span>Частей новой сети</span><span>${s.network_parts ?? '—'}</span>
+        <span>Штраф</span><span>${fmt(s.unconnected_penalty / 1e6, 1)} млн ₽</span>
+        <span>Не подключены</span><span>${(s.unconnected_oks_ids || []).join(', ') || 'нет'}</span>
+      </div>
+      <ul class="checks">${checks}</ul>`;
+    div.onclick = () => { activeVariant = s.variant_id; unconnected = new Set((s.unconnected_oks_ids || []).map(String)); renderVariants(); drawInput(); drawResult(); };
+    box.appendChild(div);
+    if (String(s.variant_id) === String(activeVariant)) unconnected = new Set((s.unconnected_oks_ids || []).map(String));
+  }
+}
+
+function renderWarnings(list) {
+  const card = document.getElementById('warnCard');
+  const ul = document.getElementById('warnings');
+  ul.innerHTML = (list || []).map(w => `<li>${esc(w)}</li>`).join('');
+  card.style.display = list && list.length ? '' : 'none';
+}
+
+function showAll() { renderVariants(); drawInput(); drawResult(); }
+
+// ---------- локальные файлы
+function readLocal(input, cb) {
+  input.onchange = () => {
+    const f = input.files[0]; if (!f) return;
+    const r = new FileReader(); r.onload = () => cb(JSON.parse(r.result)); r.readAsText(f);
+  };
+}
+readLocal(document.getElementById('localIn'), d => { inputData = d; showAll(); });
+readLocal(document.getElementById('localOut'), d => { resultData = d; activeVariant = null; showAll(); });
+
+// ---------- сервер
+const statusEl = document.getElementById('status');
+async function refreshJobs() {
+  try {
+    const r = await fetch('api/jobs'); if (!r.ok) throw 0;
+    const list = await r.json();
+    const sel = document.getElementById('jobs');
+    sel.innerHTML = '<option value="">— предыдущие задачи —</option>' + list.map(j =>
+      `<option value="${j.id}">${esc(j.file_name || j.id)} · ${j.status}</option>`).join('');
+  } catch (e) { document.getElementById('uploadCard').style.opacity = .6; statusEl.textContent = 'Сервер недоступен — можно открыть файлы локально.'; }
+}
+async function loadJob(id) {
+  const st = await (await fetch('api/jobs/' + id)).json();
+  statusEl.textContent = `Задача ${id.slice(0, 8)}: ${st.status}` + (st.error ? ' — ' + st.error : '');
+  if (st.status === 'QUEUED' || st.status === 'RUNNING') { setTimeout(() => loadJob(id), 1500); return; }
+  if (st.status !== 'DONE') return;
+  const [inp, res, sum] = await Promise.all([
+    st.file_size < 80e6 ? fetch('api/jobs/' + id + '/input').then(r => r.json()) : Promise.resolve(null),
+    fetch('api/jobs/' + id + '/result').then(r => r.json()),
+    fetch('api/jobs/' + id + '/summary').then(r => r.json())
+  ]);
+  inputData = inp; resultData = res; activeVariant = null;
+  const a = document.getElementById('download'); a.href = 'api/jobs/' + id + '/result'; a.style.display = '';
+  renderWarnings(sum.warnings);
+  statusEl.textContent += ` · ${sum.stats.total_ms} мс, граф ${sum.stats.graph_nodes} вершин`;
+  showAll(); refreshJobs();
+}
+document.getElementById('run').onclick = async () => {
+  const f = document.getElementById('file').files[0];
+  if (!f) { statusEl.textContent = 'Выберите файл GeoJSON'; return; }
+  const fd = new FormData(); fd.append('file', f);
+  statusEl.textContent = 'Загрузка…';
+  const r = await fetch('api/jobs', { method: 'POST', body: fd });
+  if (!r.ok) { statusEl.textContent = 'Ошибка загрузки: ' + r.status; return; }
+  const j = await r.json(); loadJob(j.id);
+};
+document.getElementById('jobs').onchange = e => e.target.value && loadJob(e.target.value);
+
+if (window.EMBEDDED) { inputData = window.EMBEDDED.input; resultData = window.EMBEDDED.result; renderWarnings(window.EMBEDDED.warnings); showAll(); }
+else refreshJobs();
+</script>
+</body>
+</html>
