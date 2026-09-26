@@ -46,6 +46,10 @@ public final class Planner {
         /** Радиус исключения точек врезки основного варианта при поиске альтернативного, м. */
         public double altTieExclusion = 40;
         public int maxVariants = 3;
+        /** Предел перестроений локального улучшения порядка вставки на вариант (0 — без улучшения). */
+        public int improveEvals = 2000;
+        /** Страховочный предел времени локального улучшения на вариант, мс. */
+        public long improveMs = 60000;
     }
 
     private static final int TARGET = 0;
@@ -58,6 +62,8 @@ public final class Planner {
     private final RuleBook rules;
     private final Options opt;
     private final PlanResult result = new PlanResult();
+    /** Куда пишется диагностика построения (во время локального поиска — во временный список). */
+    private List<String> warnSink = result.warnings;
 
     private Env env;
     private VisGraph g;
@@ -128,6 +134,10 @@ public final class Planner {
         final int[] chamberUsed = new int[data.chambers.size()];
         final TNode[] targetNode = new TNode[data.targets.size()];
         final List<TNode> roots = new ArrayList<>();
+        /** Порядок подключения точек. */
+        final List<Integer> order = new ArrayList<>();
+        /** Число точек, подключённых со снятым ограничением стратегии. */
+        int relaxed;
 
         TNode add(int kind, double x, double y) {
             TNode n = new TNode();
@@ -155,12 +165,15 @@ public final class Planner {
         TNode snap;
         int[] path;
         int entry;
+        boolean relaxed;
     }
 
     private static final class Strategy {
         String name;
         boolean allowBranch = true;
         List<double[]> forbiddenTies = Collections.emptyList();
+        /** Итог локального улучшения — попадает в checks варианта. */
+        String improveNote;
     }
 
     // ================================================================== run
@@ -194,14 +207,14 @@ public final class Planner {
         List<PlanResult.Variant> vs = new ArrayList<>();
         Strategy s1 = new Strategy();
         s1.name = "Совместное подключение (дерево Штейнера, жадная эвристика)";
-        Forest f1 = plan(s1);
-        PlanResult.Variant v1 = build(f1, s1);
+        Forest f1 = planBest(s1);
+        PlanResult.Variant v1 = build(f1, s1, true);
         vs.add(v1);
 
         Strategy s2 = new Strategy();
         s2.name = "Раздельное подключение каждой точки";
         s2.allowBranch = false;
-        vs.add(build(plan(s2), s2));
+        vs.add(build(planBest(s2), s2, true));
 
         Strategy s3 = new Strategy();
         s3.name = "Совместное подключение с альтернативными точками врезки";
@@ -210,7 +223,7 @@ public final class Planner {
             forb.add(new double[]{r.x, r.y});
         }
         s3.forbiddenTies = forb;
-        vs.add(build(plan(s3), s3));
+        vs.add(build(planBest(s3), s3, true));
 
         // уникальность и ранжирование
         List<PlanResult.Variant> uniq = new ArrayList<>();
@@ -838,16 +851,7 @@ public final class Planner {
             Goal best = null;
             int bestT = -1;
             for (int t : remaining) {
-                Goal gl = connect(t, F, st, true);
-                if (gl == null && !st.forbiddenTies.isEmpty()) {
-                    gl = connect(t, F, st, false); // запрет альтернативы не должен приводить к неподключению
-                }
-                if (gl == null && !st.allowBranch) {
-                    // раздельная схема не должна приводить к неподключению: разрешаем ответвление
-                    Strategy relaxed = new Strategy();
-                    relaxed.name = st.name;
-                    gl = connect(t, F, relaxed, false);
-                }
+                Goal gl = connectAny(t, F, st);
                 if (gl != null && (best == null || gl.cost < best.cost)) {
                     best = gl;
                     bestT = t;
@@ -862,6 +866,103 @@ public final class Planner {
         return F;
     }
 
+    /** Подключение точки по стратегии; ограничения стратегии снимаются, если иначе точка не подключается. */
+    private Goal connectAny(int t, Forest F, Strategy st) {
+        Goal gl = connect(t, F, st, true);
+        if (gl == null && !st.forbiddenTies.isEmpty()) {
+            gl = connect(t, F, st, false); // запрет альтернативы не должен приводить к неподключению
+            if (gl != null) {
+                gl.relaxed = true;
+            }
+        }
+        if (gl == null && !st.allowBranch) {
+            // раздельная схема не должна приводить к неподключению: разрешаем ответвление
+            Strategy relaxed = new Strategy();
+            relaxed.name = st.name;
+            gl = connect(t, F, relaxed, false);
+            if (gl != null) {
+                gl.relaxed = true;
+            }
+        }
+        return gl;
+    }
+
+    /** Построение леса при фиксированном порядке подключения точек. */
+    private Forest planOrder(Strategy st, List<Integer> order) {
+        env.resetNew();
+        Forest F = new Forest();
+        for (int t : order) {
+            Goal gl = connectAny(t, F, st);
+            if (gl != null) {
+                commit(F, t, gl);
+            }
+        }
+        return F;
+    }
+
+    /** Жадное построение и локальное улучшение порядка вставки. */
+    private Forest planBest(Strategy st) {
+        Forest F = plan(st);
+        return opt.improveEvals > 0 ? improve(st, F) : F;
+    }
+
+    /**
+     * Локальный поиск по порядку вставки: точка переносится на другую позицию, лес перестраивается
+     * в новом порядке, перенос принимается при уменьшении S (первое улучшение, затем поиск заново).
+     * Предел — число перестроений, поэтому результат детерминирован.
+     */
+    private Forest improve(Strategy st, Forest greedy) {
+        long t0 = System.currentTimeMillis();
+        List<Integer> best = new ArrayList<>(greedy.order);
+        for (int t = 0; t < data.targets.size(); t++) {
+            if (eOpts[t].length > 0 && !best.contains(t)) {
+                best.add(t); // неподключённые жадно — в конец, вдруг в другом порядке найдётся маршрут
+            }
+        }
+        double s0 = build(greedy, st, false).score;
+        double bestS = s0;
+        List<String> saved = warnSink;
+        warnSink = new ArrayList<>(); // промежуточные перестроения не пишут в диагностику
+        int evals = 0;
+        int accepted = 0;
+        int n = best.size();
+        int moves = n * n;
+        boolean stop = false;
+        // переносы (i → j) перебираются по кругу; после улучшения перебор продолжается с того же места,
+        // остановка — когда полный круг прошёл без улучшений
+        for (int m = 0, idle = 0; idle < moves; m = (m + 1) % moves, idle++) {
+            int i = m / n;
+            int j = m % n;
+            if (j == i || j == i - 1) {
+                continue; // перенос i на i-1 совпадает с переносом i-1 на i
+            }
+            if (evals >= opt.improveEvals || System.currentTimeMillis() - t0 > opt.improveMs) {
+                stop = true;
+                break;
+            }
+            List<Integer> o = new ArrayList<>(best);
+            o.add(j, o.remove(i));
+            evals++;
+            Forest F = planOrder(st, o);
+            if (F.relaxed > greedy.relaxed) {
+                continue; // стратегия варианта не должна размываться снятием её ограничений
+            }
+            double s = build(F, st, false).score;
+            if (s < bestS - 1e-9) {
+                best = o;
+                bestS = s;
+                accepted++;
+                idle = 0;
+            }
+        }
+        warnSink = saved;
+        st.improveNote = String.format(Locale.ROOT,
+                "Локальное улучшение порядка вставки: S %.4f → %.4f (%d перестроений, принято %d%s, %d мс)",
+                s0, bestS, evals, accepted, stop ? ", остановлено по пределу" : ", локальный минимум",
+                System.currentTimeMillis() - t0);
+        return planOrder(st, best); // финальное построение — с диагностикой и состоянием новой сети
+    }
+
     private void commit(Forest F, int t, Goal gl) {
         InputData.Target T = data.targets.get(t);
         double ft = T.flow;
@@ -871,6 +972,10 @@ public final class Planner {
         tn.outId = T.id;
         tn.entry = gl.entry;
         F.targetNode[t] = tn;
+        F.order.add(t);
+        if (gl.relaxed) {
+            F.relaxed++;
+        }
         chain.add(tn);
         for (int v : gl.path) {
             chain.add(F.add(VERTEX, g.x[v], g.y[v]));
@@ -944,7 +1049,7 @@ public final class Planner {
         if (e == null) {
             double l = Geo.dist(n.x, n.y, p.x, p.y);
             e = new Edge(l, l, Edge.NONE);
-            result.warnings.add(String.format(Locale.ROOT,
+            warnSink.add(String.format(Locale.ROOT,
                     "Отрезок (%.1f, %.1f)–(%.1f, %.1f) не прошёл повторную проверку", n.x, n.y, p.x, p.y));
         }
         n.up = e;
@@ -966,7 +1071,8 @@ public final class Planner {
         return n.kind != VERTEX;
     }
 
-    private PlanResult.Variant build(Forest F, Strategy st) {
+    /** @param full false — только стоимость и S (для локального поиска), без проверки правил и сигнатуры */
+    private PlanResult.Variant build(Forest F, Strategy st, boolean full) {
         PlanResult.Variant v = new PlanResult.Variant();
         v.id = "tmp";
         v.strategy = st.name;
@@ -1075,6 +1181,12 @@ public final class Planner {
         v.constructionCost = lineCost + v.chamberCost + v.tieInCost;
         v.calculatedCost = v.constructionCost + v.penalty;
         v.score = rules.score(v.calculatedCost, v.length);
+        if (!full) {
+            return v;
+        }
+        if (st.improveNote != null) {
+            v.checks.add(st.improveNote);
+        }
         validate(F, chains, v);
         v.signature = signature(F);
         return v;
