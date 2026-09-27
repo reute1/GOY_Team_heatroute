@@ -5,12 +5,15 @@ import ru.lct.heatroute.core.geo.Utm;
 import ru.lct.heatroute.core.json.Json;
 import ru.lct.heatroute.core.model.InputData;
 import ru.lct.heatroute.core.model.RuleBook;
+import ru.lct.heatroute.core.model.SearchArea;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -30,23 +33,89 @@ public final class InputReader {
         this.rules = rules;
     }
 
+    /** Однопроходное чтение потока: все объекты сохраняются. */
     public InputData read(InputStream in) throws IOException {
         InputData data = new InputData();
-        Json.Parser p = new Json.Parser(new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8), 1 << 16));
-        Map<String, Object> top = p.streamFeatures(f -> {
-            data.featureCount++;
-            try {
-                accept(data, f);
-            } catch (RuntimeException e) {
-                data.warnings.add("Объект #" + data.featureCount + " пропущен: " + e.getMessage());
-            }
+        pass(in, data, null, 0);
+        postProcess(data);
+        return data;
+    }
+
+    /**
+     * Двухпроходное чтение файла (для больших наборов). Проход 1: точки подключения, сеть, камеры —
+     * по ним строится область поиска. Проход 2: только ограничения, касающиеся области, расширенной
+     * на {@code extra} м; сеть и камеры дальше области тоже отбрасываются. В памяти остаётся лишь
+     * окрестность подключаемых объектов, а не весь город.
+     */
+    public InputData read(Path file, double extra) throws IOException {
+        InputData data = new InputData();
+        try (InputStream in = Files.newInputStream(file)) {
+            pass(in, data, false, 0);
+        }
+        SearchArea area = SearchArea.build(data.targets, data.network);
+        data.area = area;
+        long before = data.network.size() + data.chambers.size();
+        data.network.removeIf(nl -> {
+            double[] b = bbox(nl.coords);
+            return !area.touches(b[0], b[1], b[2], b[3], extra + 1);
         });
-        Object crs = top.get("crs");
-        if (crs != null && !String.valueOf(crs).contains("4326") && !String.valueOf(crs).contains("CRS84")) {
-            data.warnings.add("CRS входного файла не WGS 84: " + crs + " — координаты интерпретируются как lon/lat");
+        data.chambers.removeIf(c -> !area.touches(c.x, c.y, c.x, c.y, extra));
+        data.skippedOutsideArea = before - data.network.size() - data.chambers.size();
+        try (InputStream in = Files.newInputStream(file)) {
+            pass(in, data, true, extra);
+        }
+        for (int i = 0; i < data.restrictions.size(); i++) {
+            data.restrictions.get(i).index = i;
+        }
+        if (data.skippedOutsideArea > 0) {
+            data.warnings.add("Вне области поиска трасс (+" + Math.round(extra) + " м) отброшено объектов: "
+                    + data.skippedOutsideArea + " — на расчёт они повлиять не могут");
         }
         postProcess(data);
         return data;
+    }
+
+    /**
+     * @param restrictions null — все объекты; false — всё, кроме ограничений; true — только ограничения,
+     *                     касающиеся области поиска, расширенной на extra
+     */
+    private void pass(InputStream in, InputData data, Boolean restrictions, double extra) throws IOException {
+        long[] seq = {0};
+        Json.Parser p = new Json.Parser(new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8), 1 << 16));
+        Map<String, Object> top = p.streamFeatures(f -> {
+            seq[0]++;
+            if (restrictions != null && restrictions != isRestriction(f)) {
+                return;
+            }
+            if (!Boolean.TRUE.equals(restrictions)) {
+                data.featureCount++;
+            }
+            int n = data.restrictions.size();
+            int w = data.warnings.size();
+            try {
+                accept(data, f);
+            } catch (RuntimeException e) {
+                data.warnings.add("Объект #" + seq[0] + " пропущен: " + e.getMessage());
+            }
+            if (Boolean.TRUE.equals(restrictions)) {
+                data.featureCount++;
+                if (data.restrictions.size() > n) {
+                    double[] b = bbox(data.restrictions.get(n).shape);
+                    if (!data.area.touches(b[0], b[1], b[2], b[3], extra)) {
+                        data.restrictions.remove(n);
+                        data.skippedOutsideArea++;
+                        while (data.warnings.size() > w) {
+                            data.warnings.remove(data.warnings.size() - 1); // диагностика только по нужным объектам
+                        }
+                    }
+                }
+            }
+        });
+        Object crs = top.get("crs");
+        if (restrictions != Boolean.TRUE && crs != null
+                && !String.valueOf(crs).contains("4326") && !String.valueOf(crs).contains("CRS84")) {
+            data.warnings.add("CRS входного файла не WGS 84: " + crs + " — координаты интерпретируются как lon/lat");
+        }
     }
 
     @SuppressWarnings("unchecked")
@@ -155,10 +224,20 @@ public final class InputReader {
             d.warnings.add("Во входных данных нет существующей тепловой сети (heat_network)");
         }
         // Число примыканий существующих линий к каждой камере.
+        List<double[]> boxes = new ArrayList<>();
+        for (InputData.NetLine nl : d.network) {
+            boxes.add(bbox(nl.coords));
+        }
         for (InputData.Chamber c : d.chambers) {
             int adj = 0;
             double best = Double.MAX_VALUE;
-            for (InputData.NetLine nl : d.network) {
+            for (int li = 0; li < d.network.size(); li++) {
+                double[] bb = boxes.get(li);
+                double far = Math.max(Math.max(bb[0] - c.x, c.x - bb[2]), Math.max(bb[1] - c.y, c.y - bb[3]));
+                if (far > 0.5 && far >= best) {
+                    continue; // линия заведомо дальше 0,5 м и не ближе уже найденной
+                }
+                InputData.NetLine nl = d.network.get(li);
                 double[] a = nl.coords;
                 int n = a.length / 2;
                 if (Geo.dist(c.x, c.y, a[0], a[1]) < 0.5) {
@@ -190,6 +269,44 @@ public final class InputReader {
     }
 
     // ---------------------------------------------------------------- helpers
+
+    @SuppressWarnings("unchecked")
+    private static boolean isRestriction(Map<String, Object> f) {
+        Object props = f.get("properties");
+        if (!(props instanceof Map)) {
+            return false;
+        }
+        Object t = ((Map<String, Object>) props).get("object_type");
+        return t != null && "restriction".equalsIgnoreCase(t.toString().trim());
+    }
+
+    /** Габаритный прямоугольник {minX, minY, maxX, maxY}. */
+    private static double[] bbox(double[] c) {
+        double[] b = {Double.MAX_VALUE, Double.MAX_VALUE, -Double.MAX_VALUE, -Double.MAX_VALUE};
+        for (int i = 0; i + 1 < c.length; i += 2) {
+            b[0] = Math.min(b[0], c[i]);
+            b[1] = Math.min(b[1], c[i + 1]);
+            b[2] = Math.max(b[2], c[i]);
+            b[3] = Math.max(b[3], c[i + 1]);
+        }
+        return b;
+    }
+
+    private static double[] bbox(InputData.Shape s) {
+        double[] b = {Double.MAX_VALUE, Double.MAX_VALUE, -Double.MAX_VALUE, -Double.MAX_VALUE};
+        List<double[]> parts = new ArrayList<>(s.lines);
+        for (double[][] poly : s.polygons) {
+            parts.add(poly[0]);
+        }
+        for (double[] c : parts) {
+            double[] p = bbox(c);
+            b[0] = Math.min(b[0], p[0]);
+            b[1] = Math.min(b[1], p[1]);
+            b[2] = Math.max(b[2], p[2]);
+            b[3] = Math.max(b[3], p[3]);
+        }
+        return b;
+    }
 
     private static String str(Object o) {
         return o == null ? null : o.toString();

@@ -3,6 +3,7 @@ package ru.lct.heatroute.core.route;
 import ru.lct.heatroute.core.geo.Geo;
 import ru.lct.heatroute.core.model.InputData;
 import ru.lct.heatroute.core.model.RuleBook;
+import ru.lct.heatroute.core.model.SearchArea;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -188,6 +189,9 @@ public final class Planner {
             total += t.flow;
         }
         prepareNetwork();
+        if (data.area == null) {
+            data.area = SearchArea.build(data.targets, data.network);
+        }
         double maxGroupFlow = maxGroupFlow();
         designDn = dnOf(maxGroupFlow);
         result.stats.put("targets", data.targets.size());
@@ -197,7 +201,10 @@ public final class Planner {
 
         env = new Env(data, rules, designDn);
         List<double[]> pts = env.generateNodes(ctx);
+        int generated = pts.size();
+        pts.removeIf(p -> !data.area.contains(p[0], p[1])); // вершины — только в области поиска
         int base = pts.size();
+        result.stats.put("graph_nodes_outside_area", generated - base);
         prepareTargets(pts);
         g = new VisGraph(pts);
         g.build(env, opt.maxEdge);
@@ -290,15 +297,7 @@ public final class Planner {
      */
     private double maxGroupFlow() {
         int nt = data.targets.size();
-        double[] dNet = new double[nt];
-        for (int t = 0; t < nt; t++) {
-            InputData.Target T = data.targets.get(t);
-            double best = Double.POSITIVE_INFINITY;
-            for (int s = 0; s < nsAx.length; s++) {
-                best = Math.min(best, Geo.pointSegDist(T.x, T.y, nsAx[s], nsAy[s], nsBx[s], nsBy[s]));
-            }
-            dNet[t] = best;
-        }
+        double[] dNet = data.area.dNet;
         int[] parent = new int[nt];
         for (int t = 0; t < nt; t++) {
             parent[t] = t;
@@ -307,7 +306,7 @@ public final class Planner {
             InputData.Target A = data.targets.get(i);
             for (int j = i + 1; j < nt; j++) {
                 InputData.Target B = data.targets.get(j);
-                double reach = GROUP_DETOUR * (dNet[i] + dNet[j]) + GROUP_MARGIN;
+                double reach = SearchArea.DETOUR * (dNet[i] + dNet[j]) + GROUP_MARGIN;
                 if (Geo.dist(A.x, A.y, B.x, B.y) < reach) {
                     parent[find(parent, i)] = find(parent, j);
                 }
@@ -330,8 +329,7 @@ public final class Planner {
     /** Группа точки (представитель в системе непересекающихся множеств). */
     private int[] groupOf;
 
-    /** Запас на обходы препятствий при группировке точек. */
-    private static final double GROUP_DETOUR = 1.5;
+    /** Запас при группировке точек (обходы — {@link SearchArea#DETOUR}). */
     private static final double GROUP_MARGIN = 100;
 
     private static int find(int[] p, int i) {

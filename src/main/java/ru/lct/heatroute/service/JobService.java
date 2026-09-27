@@ -14,10 +14,8 @@ import ru.lct.heatroute.core.route.Planner;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
-import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.StringWriter;
 import java.nio.file.Files;
@@ -88,9 +86,8 @@ public class JobService {
     private void run(String id) {
         Path dir = storage.resolve(id);
         jdbc.update("UPDATE jobs SET status='RUNNING', started_at=? WHERE id=?", Timestamp.from(Instant.now()), id);
-        try (InputStream in = new BufferedInputStream(Files.newInputStream(dir.resolve("input.geojson")), 1 << 16);
-             OutputStream out = new BufferedOutputStream(Files.newOutputStream(dir.resolve("result.geojson")), 1 << 16)) {
-            PlanResult r = new HeatRouteEngine(RuleBook.defaults(), options).process(in, out);
+        try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(dir.resolve("result.geojson")), 1 << 16)) {
+            PlanResult r = new HeatRouteEngine(RuleBook.defaults(), options).process(dir.resolve("input.geojson"), out);
             jdbc.update("UPDATE jobs SET status='DONE', finished_at=?, summary=? WHERE id=?",
                     Timestamp.from(Instant.now()), summaryJson(r), id);
         } catch (Throwable e) {

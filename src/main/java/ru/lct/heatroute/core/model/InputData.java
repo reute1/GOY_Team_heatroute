@@ -60,4 +60,8 @@ public final class InputData {
     /** Диагностика входных данных (пропуски атрибутов, некорректная геометрия и т.п.). */
     public final List<String> warnings = new ArrayList<>();
     public long featureCount;
+    /** Область поиска трасс; null — строится планировщиком по точкам и сети. */
+    public SearchArea area;
+    /** Объекты, отброшенные при чтении как лежащие вне области поиска. */
+    public long skippedOutsideArea;
 }

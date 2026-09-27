@@ -8,7 +8,6 @@ import ru.lct.heatroute.core.model.RuleBook;
 import ru.lct.heatroute.core.route.PlanResult;
 import ru.lct.heatroute.core.route.Planner;
 
-import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -32,13 +31,37 @@ public final class HeatRouteEngine {
         this.options = options;
     }
 
+    /** Расчёт по потоку (однопроходное чтение, все объекты в памяти). */
     public PlanResult process(InputStream in, OutputStream out) throws IOException {
         long t0 = System.currentTimeMillis();
         InputData data = new InputReader(utm, rules).read(in);
-        long tRead = System.currentTimeMillis() - t0;
+        return plan(data, System.currentTimeMillis() - t0, out);
+    }
+
+    /**
+     * Расчёт по файлу: двухпроходное чтение, в памяти только окрестность подключаемых объектов —
+     * для больших входных файлов (до 3 ГБ).
+     */
+    public PlanResult process(Path in, OutputStream out) throws IOException {
+        long t0 = System.currentTimeMillis();
+        InputData data = new InputReader(utm, rules).read(in, reach());
+        return plan(data, System.currentTimeMillis() - t0, out);
+    }
+
+    /**
+     * Насколько далеко от области поиска объекты ещё могут повлиять на расчёт: ребро графа между
+     * вершинами области отходит от вершины не дальше maxEdge/2, отрезок до места врезки —
+     * не дальше радиуса поиска врезки; плюс запас на отступы и габариты.
+     */
+    private double reach() {
+        return Math.max(options.tieSearchRadius, options.maxEdge / 2) + 50;
+    }
+
+    private PlanResult plan(InputData data, long tRead, OutputStream out) throws IOException {
         PlanResult r = new Planner(data, rules, options).run();
         r.warnings.addAll(0, data.warnings);
         r.stats.put("input_features", data.featureCount);
+        r.stats.put("skipped_outside_area", data.skippedOutsideArea);
         r.stats.put("read_ms", tRead);
         new OutputWriter(utm).write(r, out);
         return r;
@@ -53,9 +76,8 @@ public final class HeatRouteEngine {
         Path in = Paths.get(args[0]);
         Path out = Paths.get(args[1]);
         PlanResult r;
-        try (InputStream is = new BufferedInputStream(Files.newInputStream(in));
-             OutputStream os = new BufferedOutputStream(Files.newOutputStream(out))) {
-            r = new HeatRouteEngine().process(is, os);
+        try (OutputStream os = new BufferedOutputStream(Files.newOutputStream(out))) {
+            r = new HeatRouteEngine().process(in, os);
         }
         System.out.println("Статистика: " + r.stats);
         for (String w : r.warnings) {
