@@ -49,6 +49,8 @@ public final class PlanResult {
         /** Сколько отдельных частей новой сети (мест присоединения). */
         public int parts;
         public final List<String> checks = new ArrayList<>();
+        /** Проверка предельной длины: по каждому ДУ наибольшая серия участков и предел. */
+        public final List<Map<String, Object>> lengthCheck = new ArrayList<>();
         public String signature;
     }
 

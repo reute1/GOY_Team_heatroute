@@ -31,6 +31,9 @@
   .checks { margin:6px 0 0; padding-left:16px; font-size:12px; color:var(--muted); }
   .checks li.bad { color:var(--bad); }
   .strategy { font-size:12px; color:var(--muted); }
+  .lenchk { width:100%; border-collapse:collapse; font-size:12px; margin-top:8px; font-variant-numeric: tabular-nums; }
+  .lenchk caption { text-align:left; color:var(--muted); padding-bottom:2px; }
+  .lenchk td { padding:1px 4px 1px 0; }
   #map { height:100vh; background:#eef0f3; }
   .legend { background:#fff; padding:8px 10px; border-radius:8px; box-shadow:0 1px 4px rgba(0,0,0,.2); font-size:12px; line-height:1.6; }
   .legend i { display:inline-block; width:18px; height:4px; vertical-align:middle; margin-right:6px; }
@@ -159,6 +162,20 @@ function drawResult() {
   }).addTo(layers.result);
 }
 
+// Проверка предельной длины: наибольшая серия участков одного ДУ на пути до места присоединения против предела
+function lengthTable(rows) {
+  if (!rows || !rows.length) return '';
+  const tr = rows.map(r => {
+    const pct = r.max_length ? r.max_series_length / r.max_length : 0;
+    const col = pct > 1 ? 'var(--bad)' : 'var(--ok)';
+    return `<tr><td>ДУ ${r.diameter}</td><td style="text-align:right">${fmt(r.max_series_length)} / ${fmt(r.max_length)} м</td>
+      <td style="width:70px"><div style="background:var(--line);border-radius:3px;height:6px"><div style="width:${Math.min(100, pct * 100)}%;background:${col};height:6px;border-radius:3px"></div></div></td>
+      <td style="color:var(--muted)">т. ${esc(r.from_oks_id)}</td></tr>`;
+  }).join('');
+  return `<table class="lenchk" title="Наибольшая длина серии участков одного ДУ на пути от точки подключения до места присоединения и предельная длина по таблице 1">
+    <caption>Предельная длина (серия / предел)</caption>${tr}</table>`;
+}
+
 function renderVariants() {
   const box = document.getElementById('variants');
   box.innerHTML = '';
@@ -183,6 +200,7 @@ function renderVariants() {
         <span>Штраф</span><span>${fmt(s.unconnected_penalty / 1e6, 1)} млн ₽</span>
         <span>Не подключены</span><span>${(s.unconnected_oks_ids || []).join(', ') || 'нет'}</span>
       </div>
+      ${lengthTable(s.dn_length_check)}
       <ul class="checks">${checks}</ul>`;
     div.onclick = () => { activeVariant = s.variant_id; unconnected = new Set((s.unconnected_oks_ids || []).map(String)); renderVariants(); drawInput(); drawResult(); };
     box.appendChild(div);

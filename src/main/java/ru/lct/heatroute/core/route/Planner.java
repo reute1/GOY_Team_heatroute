@@ -1530,25 +1530,51 @@ public final class Planner {
                 }
             }
         }
+        // Предельная длина: по каждому пути «точка → место присоединения» серии участков одного ДУ;
+        // для отчёта — самая длинная серия каждого ДУ и путь, на котором она получена.
+        Map<Integer, double[]> maxRun = new java.util.TreeMap<>(); // dn → {длина, индекс точки}
+        int over = 0;
         for (Chain leaf : chains) {
             if (leaf.nodes.get(0).kind != TARGET) {
                 continue;
             }
             double run = 0;
             int dn = -1;
+            boolean reported = false;
             for (Chain c = leaf; c != null; c = c.parent) {
                 if (c.dn != dn) {
                     run = 0;
                     dn = c.dn;
                 }
                 run += c.length;
+                double[] m = maxRun.computeIfAbsent(dn, k -> new double[]{0, -1});
+                if (run > m[0]) {
+                    m[0] = run;
+                    m[1] = leaf.nodes.get(0).target;
+                }
                 RuleBook.Pipe p = rules.pipeByDn(dn);
-                if (p != null && run > p.maxLength + 1e-6) {
+                if (p != null && run > p.maxLength + 1e-6 && !reported) {
                     v.checks.add("Превышена предельная длина ДУ" + dn + " на пути от точки " + leaf.nodes.get(0).outId);
-                    break;
+                    reported = true;
+                    over++;
                 }
             }
         }
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<Integer, double[]> e : maxRun.entrySet()) {
+            RuleBook.Pipe p = rules.pipeByDn(e.getKey());
+            double lim = p != null ? p.maxLength : Double.NaN;
+            Map<String, Object> row = new java.util.LinkedHashMap<>();
+            row.put("diameter", e.getKey());
+            row.put("max_series_length", round(e.getValue()[0], 1));
+            row.put("max_length", lim);
+            row.put("from_oks_id", data.targets.get((int) e.getValue()[1]).id);
+            v.lengthCheck.add(row);
+            sb.append(sb.length() == 0 ? "" : "; ").append(String.format(Locale.ROOT, "ДУ%d — %.0f из %.0f м",
+                    e.getKey(), e.getValue()[0], lim));
+        }
+        v.checks.add((over == 0 ? "Предельная длина: нарушений нет (" : "Предельная длина: нарушений " + over + " (")
+                + "наибольшая серия участков одного ДУ на пути до места присоединения: " + sb + ")");
         v.checks.add(bad == 0 ? "Отступы и пересечения с фактическими ДУ: нарушений нет"
                 : "Отступы с фактическими ДУ: нарушений " + bad + " (трасса строилась для расчётного ДУ" + designDn + ")");
         v.checks.add(turns == 0 ? "Углы поворота ≤ 90°: нарушений нет" : "Повороты > 90°: " + turns);

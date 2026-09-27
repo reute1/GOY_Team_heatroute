@@ -79,6 +79,7 @@ public final class OutputWriter {
             s.put("strategy", v.strategy);
             s.put("network_parts", v.parts);
             s.put("checks", v.checks);
+            s.put("dn_length_check", v.lengthCheck);
             first = feature(w, first, s, null);
         }
         w.write("\n]}\n");

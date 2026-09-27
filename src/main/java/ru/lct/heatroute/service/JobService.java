@@ -144,6 +144,7 @@ public class JobService {
             x.put("network_parts", v.parts);
             x.put("unconnected_oks_ids", v.unconnected);
             x.put("checks", v.checks);
+            x.put("dn_length_check", v.lengthCheck);
             vs.add(x);
         }
         m.put("variants", vs);
