@@ -2,6 +2,10 @@
 
 Прототип решения кейса ДИТ Москвы («Лидеры цифровой трансформации 2026»). Сервис получает один GeoJSON с существующей тепловой сетью, камерами, точками подключения перспективных ОКС и пространственными ограничениями. По нему он автоматически строит до трёх вариантов новой сети и выгружает результат в GeoJSON по разделу 7 технического приложения.
 
+**Документация для команды:**
+- [docs/01_project_overview.md](docs/01_project_overview.md) — подробное описание проекта: задача, архитектура, алгоритм, проверки, допущения, карта кода, вопросы к защите;
+- [docs/02_setup_guide.md](docs/02_setup_guide.md) — как развернуть у себя: Docker, разработка без Docker, ядро из командной строки, инструменты, решение проблем.
+
 ## Быстрый старт
 
 ```bash
@@ -24,8 +28,8 @@ API:
 Ядро можно запустить без Spring и без БД:
 
 ```bash
-javac --release 11 -encoding UTF-8 -d out $(find src/main/java/ru/lct/heatroute/core -name '*.java')
-java -Xmx4g -cp out ru.lct.heatroute.core.HeatRouteEngine data/dataset.geojson result.geojson
+mvn package -DskipTests
+java -Xmx4g -cp target/classes ru.lct.heatroute.core.HeatRouteEngine data/dataset.geojson result.geojson
 ```
 
 Проверка результата независимым валидатором (Python, без зависимостей):
